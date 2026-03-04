@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>강의록 자동 생성기</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://unpkg.com/file-saver@2.0.5/dist/FileSaver.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0f0f13; font-family: 'Noto Sans KR', sans-serif; color: #e8e4dc; }
+  ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: #111; }
+  ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes fadeIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+  .fade-in { animation: fadeIn 0.35s ease; }
+  textarea:focus, input:focus { border-color: #7c5cbf !important; outline: none; }
+  button:hover:not(:disabled) { opacity:0.85; transition:all 0.15s; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+
+const { useState, useRef, useCallback, useEffect } = React;
+const BATCH_SIZE = 5;
+
+const SYSTEM_PROMPT = `당신은 강의 녹음 트랜스크립트를 정리하는 전문 편집자입니다.
+
+주어진 작업:
+1. 슬라이드 이미지들과 강의 녹음 트랜스크립트를 분석합니다.
+2. 트랜스크립트를 최소한으로만 다듬습니다: 명백한 오탈자 수정, 반복적인 말버릇 제거("음","어","그","뭐" 등 과도한 반복), 문장 끊김 자연스럽게 연결. 내용이나 뉘앙스는 절대 바꾸지 않습니다.
+3. 각 슬라이드와 트랜스크립트의 해당 구간을 매칭합니다.
+4. hasVisual: 슬라이드에 표/그래프/그림 등 시각 자료가 있으면 true.
+
+반드시 아래 JSON 형식으로만 응답하세요 (다른 텍스트 없이):
+{
+  "title": "강의 전체 제목",
+  "slides": [
+    {
+      "slideNumber": 1,
+      "slideTitle": "슬라이드 제목",
+      "slideContent": "슬라이드의 핵심 내용",
+      "transcript": "해당 슬라이드 구간의 다듬어진 강의 내용",
+      "keywords": ["키워드1", "키워드2"],
+      "hasVisual": false
+    }
+  ]
+}`;
+
+async function callAPI(apiKey, messages, maxTokens = 8000) {
+  const response = await fetch("http://localhost:7432/api/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Api-Key": apiKey },
+    body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: maxTokens, system: SYSTEM_PROMPT, messages })
+  });
+  if (!response.ok) {
+    const err = await response.json();
+    throw new Error(err.error?.message || "API 오류 " + response.status);
+  }
+  const data = await response.json();
+  return data.content?.map(c => c.text || "").join("") || "";
+}
+
+async function renderPdfToImages(file, onProgress) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  const total = pdf.numPages;
+  const images = new Array(total);
+  let done = 0;
+  for (let start = 0; start < total; start += 4) {
+    const end = Math.min(start + 4, total);
+    await Promise.all(
+      Array.from({ length: end - start }, (_, j) => {
+        const pageNum = start + j + 1;
+        return pdf.getPage(pageNum).then(page => {
+          const vp = page.getViewport({ scale: 1.2 });
+          const cv = document.createElement("canvas");
+          cv.width = vp.width; cv.height = vp.height;
+          return page.render({ canvasContext: cv.getContext("2d"), viewport: vp }).promise.then(() => {
+            const dataUrl = cv.toDataURL("image/jpeg", 0.7);
+            images[pageNum - 1] = { base64: dataUrl.split(",")[1], dataUrl, slideNum: pageNum };
+            done++;
+            onProgress(`슬라이드 이미지 변환 중... (${done}/${total})`);
+          });
+        });
+      })
+    );
+  }
+  return images;
+}
+
+function buildMarkdown(result, slideImages, withImageEmbed = false) {
+  const today = new Date().toISOString().split("T")[0];
+  let md = `---\ntitle: ${result.title}\ndate: ${today}\ntags: [강의록]\n---\n\n# ${result.title}\n\n> ${today} | 다글로 녹음 기반\n\n`;
+  result.slides.forEach(s => {
+    md += `## 슬라이드 ${s.slideNumber}: ${s.slideTitle}\n\n`;
+    if (withImageEmbed) {
+      const img = slideImages.find(i => i.slideNum === s.slideNumber);
+      if (img) md += `![슬라이드 ${s.slideNumber}](data:image/jpeg;base64,${img.base64})\n\n`;
+    }
+    if (s.slideContent) md += `### 슬라이드 내용\n${s.slideContent}\n\n`;
+    if (s.transcript) md += `### 강의 내용\n${s.transcript}\n\n`;
+    if (s.keywords?.length) md += `**키워드:** ${s.keywords.map(k => "#"+k).join(" ")}\n\n`;
+    md += `---\n\n`;
+  });
+  return md;
+}
+
+function buildMarkdownObsidian(result, title) {
+  const today = new Date().toISOString().split("T")[0];
+  let md = `---\ntitle: ${title}\ndate: ${today}\ntags: [강의록]\n---\n\n# ${title}\n\n> ${today} | 다글로 녹음 기반\n\n`;
+  result.slides.forEach(s => {
+    md += `## 슬라이드 ${s.slideNumber}: ${s.slideTitle}\n\n`;
+    const fname = getImgFilename(title, s.slideNumber);
+    md += `![[${fname}]]\n\n`;
+    if (s.slideContent) md += `### 슬라이드 내용\n${s.slideContent}\n\n`;
+    if (s.transcript) md += `### 강의 내용\n${s.transcript}\n\n`;
+    if (s.keywords?.length) md += `**키워드:** ${s.keywords.map(k => "#"+k).join(" ")}\n\n`;
+    md += `---\n\n`;
+  });
+  return md;
+}
+
+function getImgFilename(title, slideNum) {
+  const safe = (title || "강의").replace(/[\\/:*?"<>|]/g, "_").slice(0, 30);
+  return `${safe}_slide${String(slideNum).padStart(2,"0")}.jpg`;
+}
+
+function downloadMd(result, slideImages) {
+  const md = buildMarkdown(result, slideImages, true);
+  const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+  const today = new Date().toISOString().split("T")[0];
+  saveAs(blob, `${today}-${result.title.replace(/[\\/:*?"<>|]/g,"_")}.md`);
+}
+
+function downloadHtml(result, slideImages) {
+  const today = new Date().toISOString().split("T")[0];
+  let body = `<h1>${result.title}</h1><p style="color:#888">${today} | 다글로 녹음 기반</p><hr>`;
+  result.slides.forEach(s => {
+    const img = slideImages.find(i => i.slideNum === s.slideNumber);
+    body += `<h2>슬라이드 ${s.slideNumber}: ${s.slideTitle}</h2>`;
+    if (img) body += `<img src="data:image/jpeg;base64,${img.base64}" style="max-width:100%;border-radius:8px;margin:12px 0;border:1px solid #ddd">`;
+    if (s.slideContent) body += `<h3>슬라이드 내용</h3><pre style="background:#f5f5f5;padding:12px;border-radius:6px;white-space:pre-wrap">${s.slideContent}</pre>`;
+    if (s.transcript) body += `<h3>강의 내용</h3><p style="line-height:2;background:#f0f7ff;padding:14px;border-radius:6px;border-left:4px solid #4f8ef7">${s.transcript.replace(/\n/g,"<br>")}</p>`;
+    if (s.keywords?.length) body += `<p>${s.keywords.map(k=>`<span style="background:#ede9fe;color:#6d28d9;padding:2px 8px;border-radius:12px;margin-right:6px;font-size:12px">#${k}</span>`).join("")}</p>`;
+    body += `<hr>`;
+  });
+  const html = `<!DOCTYPE html><html lang="ko"><head><meta charset="UTF-8"><title>${result.title}</title><style>body{font-family:'Noto Sans KR',sans-serif;max-width:860px;margin:40px auto;padding:0 24px;color:#222;line-height:1.7}h1{font-size:28px;margin-bottom:6px}h2{font-size:20px;margin:32px 0 12px;color:#1a1a2e}h3{font-size:14px;color:#666;margin:16px 0 6px}hr{border:none;border-top:1px solid #eee;margin:24px 0}</style></head><body>${body}</body></html>`;
+  const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+  saveAs(blob, `${today}-${result.title.replace(/[\\/:*?"<>|]/g,"_")}.html`);
+}
+
+async function downloadDocx(result, slideImages, onStatus) {
+  // HTML 기반 Word 문서 생성 (외부 라이브러리 불필요)
+  onStatus("Word 문서 생성 중...");
+  
+  const today = new Date().toISOString().split("T")[0];
+  
+  let html = `
+    <html xmlns:o="urn:schemas-microsoft-com:office:office" 
+          xmlns:w="urn:schemas-microsoft-com:office:word"
+          xmlns="http://www.w3.org/TR/REC-html40">
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body { font-family: '맑은 고딕', 'Malgun Gothic', sans-serif; line-height: 1.6; padding: 20px; }
+        h1 { color: #1a1a2e; font-size: 24pt; border-bottom: 3px solid #7c5cbf; padding-bottom: 10px; }
+        h2 { color: #3d2a5c; font-size: 16pt; margin-top: 30px; border-bottom: 2px solid #7c5cbf; padding-bottom: 5px; }
+        .meta { color: #888; font-size: 10pt; margin-bottom: 20px; }
+        .slide-content { background: #f5f5f5; padding: 15px; border-radius: 5px; margin: 10px 0; }
+        .transcript { background: #f0f7ff; padding: 15px; border-left: 4px solid #4f8ef7; margin: 10px 0; }
+        .keywords { color: #6d28d9; font-size: 10pt; margin: 10px 0; }
+        .section-title { font-weight: bold; color: #555; margin-top: 15px; }
+        img { max-width: 100%; height: auto; margin: 10px 0; }
+      </style>
+    </head>
+    <body>
+      <h1>${result.title}</h1>
+      <p class="meta">${today} | 다글로 녹음 기반</p>
+  `;
+  
+  for (const s of result.slides) {
+    onStatus(`Word 생성 중... 슬라이드 ${s.slideNumber}`);
+    
+    html += `<h2>슬라이드 ${s.slideNumber}: ${s.slideTitle}</h2>`;
+    
+    // 이미지 추가
+    const img = slideImages.find(i => i.slideNum === s.slideNumber);
+    if (img) {
+      html += `<img src="data:image/jpeg;base64,${img.base64}" style="max-width:100%; border:1px solid #ddd;">`;
+    }
+    
+    if (s.slideContent) {
+      html += `<p class="section-title">📋 슬라이드 내용</p>`;
+      html += `<div class="slide-content">${s.slideContent.replace(/\n/g, '<br>')}</div>`;
+    }
+    
+    if (s.transcript) {
+      html += `<p class="section-title">🎙️ 강의 내용</p>`;
+      html += `<div class="transcript">${s.transcript.replace(/\n/g, '<br>')}</div>`;
+    }
+    
+    if (s.keywords?.length) {
+      html += `<p class="keywords">🏷️ 키워드: ${s.keywords.map(k => '#' + k).join('  ')}</p>`;
+    }
+    
+    html += `<hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">`;
+  }
+  
+  html += `</body></html>`;
+  
+  // Blob 생성 및 다운로드
+  const blob = new Blob(['\ufeff' + html], { type: 'application/msword' });
+  saveAs(blob, `${today}-${result.title.replace(/[\\/:*?"<>|]/g, "_")}.doc`);
+}
+async function downloadPdf(result, slideImages, onStatus) {
+  onStatus("PDF 생성 중...");
+  
+  const today = new Date().toISOString().split("T")[0];
+  
+  // HTML 문서 생성
+  let html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        @page { size: A4; margin: 20mm; }
+        body { font-family: '맑은 고딕', 'Malgun Gothic', 'Noto Sans KR', sans-serif; line-height: 1.8; color: #1a1a2e; }
+        h1 { color: #1a1a2e; font-size: 22pt; border-bottom: 3px solid #7c5cbf; padding-bottom: 10px; margin-bottom: 5px; }
+        h2 { color: #3d2a5c; font-size: 14pt; margin-top: 25px; border-bottom: 2px solid #7c5cbf; padding-bottom: 5px; page-break-after: avoid; }
+        .meta { color: #888; font-size: 10pt; margin-bottom: 20px; }
+        .slide-img { max-width: 100%; height: auto; margin: 10px 0; border: 1px solid #ddd; }
+        .section-title { font-weight: bold; color: #555; font-size: 11pt; margin: 15px 0 8px 0; }
+        .slide-content { background: #f5f5f5; padding: 12px 15px; border-radius: 5px; margin: 8px 0; font-size: 10pt; }
+        .transcript { background: #f0f7ff; padding: 12px 15px; border-left: 4px solid #4f8ef7; margin: 8px 0; font-size: 11pt; }
+        .keywords { color: #6d28d9; font-size: 9pt; margin: 10px 0; }
+        hr { border: none; border-top: 1px solid #eee; margin: 15px 0; }
+        .slide-section { page-break-inside: avoid; }
+      </style>
+    </head>
+    <body>
+      <h1>${result.title}</h1>
+      <p class="meta">${today} | 다글로 녹음 기반</p>
+  `;
+  
+  for (const s of result.slides) {
+    onStatus(`PDF 생성 중... 슬라이드 ${s.slideNumber}`);
+    
+    html += `<div class="slide-section">`;
+    html += `<h2>슬라이드 ${s.slideNumber}: ${s.slideTitle}</h2>`;
+    
+    const img = slideImages.find(i => i.slideNum === s.slideNumber);
+    if (img) {
+      html += `<img class="slide-img" src="data:image/jpeg;base64,${img.base64}">`;
+    }
+    
+    if (s.slideContent) {
+      html += `<p class="section-title">📋 슬라이드 내용</p>`;
+      html += `<div class="slide-content">${s.slideContent.replace(/\n/g, '<br>')}</div>`;
+    }
+    
+    if (s.transcript) {
+      html += `<p class="section-title">🎙️ 강의 내용</p>`;
+      html += `<div class="transcript">${s.transcript.replace(/\n/g, '<br>')}</div>`;
+    }
+    
+    if (s.keywords?.length) {
+      html += `<p class="keywords">🏷️ 키워드: ${s.keywords.map(k => '#' + k).join('  ')}</p>`;
+    }
+    
+    html += `<hr></div>`;
+  }
+  
+  html += `</body></html>`;
+  
+  // 새 창에서 열고 인쇄 다이얼로그 표시 (PDF로 저장 가능)
+  const printWindow = window.open('', '_blank');
+  printWindow.document.write(html);
+  printWindow.document.close();
+  
+  // 잠시 후 인쇄 다이얼로그 표시
+  setTimeout(() => {
+    printWindow.print();
+  }, 500);
+}
+
+function copyForHwp(result) {
+  let text = `${result.title}\n${"=".repeat(50)}\n\n`;
+  result.slides.forEach(s => {
+    text += `【슬라이드 ${s.slideNumber}】 ${s.slideTitle}\n${"-".repeat(40)}\n`;
+    if (s.slideContent) text += `[슬라이드 내용]\n${s.slideContent}\n\n`;
+    if (s.transcript) text += `[강의 내용]\n${s.transcript}\n\n`;
+    if (s.keywords?.length) text += `키워드: ${s.keywords.map(k=>"#"+k).join(" ")}\n`;
+    text += "\n";
+  });
+  navigator.clipboard.writeText(text);
+}
+
+function App() {
+  const [step, setStep] = useState(0);
+  const [transcript, setTranscript] = useState("");
+  const [pdfFile, setPdfFile] = useState(null);
+  const [result, setResult] = useState(null);
+  const [slideImages, setSlideImages] = useState([]);
+  const [error, setError] = useState("");
+  const [processingMsg, setProcessingMsg] = useState("");
+  const [progress, setProgress] = useState(0);
+  const [selectedSlide, setSelectedSlide] = useState(0);
+  const [showObsidian, setShowObsidian] = useState(false);
+  const [obsidianKey, setObsidianKey] = useState(localStorage.getItem("obs_key") || "");
+  const [obsidianFolder, setObsidianFolder] = useState(localStorage.getItem("obs_folder") || "강의록");
+  const [exportStatus, setExportStatus] = useState("");
+  const [exportLoading, setExportLoading] = useState("");
+  const [apiKey, setApiKey] = useState(localStorage.getItem("lecture_api_key") || "");
+  const [showApiKey, setShowApiKey] = useState(!localStorage.getItem("lecture_api_key"));
+  const [dragOver, setDragOver] = useState(false);
+  const [timeInfo, setTimeInfo] = useState({ elapsed: 0, remaining: null, startTime: null, batchTimes: [] });
+  const [showImages, setShowImages] = useState(true);
+  const fileRef = useRef();
+  const timerRef = useRef(null);
+  const saveApiKey = (v) => { setApiKey(v); localStorage.setItem("lecture_api_key", v); };
+  const saveObsKey = (v) => { setObsidianKey(v); localStorage.setItem("obs_key", v); };
+  const saveObsFolder = (v) => { setObsidianFolder(v); localStorage.setItem("obs_folder", v); };
+  const handleFileDrop = useCallback((e) => {
+    e.preventDefault(); setDragOver(false);
+    const file = e.dataTransfer?.files[0] || e.target.files[0];
+    if (!file) return;
+    if (!file.name.match(/\.pdf$/i)) { setError("PDF 파일만 지원됩니다."); return; }
+    setPdfFile(file); setError("");
+  }, []);
+  const handleProcess = async () => {
+    if (!apiKey.trim()) { setError("API Key를 입력해 주세요."); return; }
+    if (!transcript.trim()) { setError("트랜스크립트를 붙여넣어 주세요."); return; }
+    if (!pdfFile) { setError("PDF 파일을 업로드해 주세요."); return; }
+    setError(""); setStep(1); setProgress(1);
+    const startTime = Date.now();
+    setTimeInfo({ elapsed: 0, remaining: null, startTime, batchTimes: [] });
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = setInterval(() => {
+      setTimeInfo(prev => ({ ...prev, elapsed: Math.floor((Date.now() - startTime) / 1000) }));
+    }, 1000);
+    try {
+      const images = await renderPdfToImages(pdfFile, setProcessingMsg);
+      setSlideImages(images);
+      const totalPages = images.length;
+      const batches = [];
+      for (let i = 0; i < images.length; i += BATCH_SIZE) batches.push(images.slice(i, i + BATCH_SIZE));
+      let allSlides = [], lectureTitle = "";
+      const allSlideResults = new Array(batches.length);
+      let completedBatches = 0;
+      const processBatch = async (b) => {
+        const batch = batches[b];
+        const startSlide = batch[0].slideNum;
+        const endSlide = batch[batch.length - 1].slideNum;
+        const ratio1 = (startSlide - 1) / totalPages;
+        const ratio2 = endSlide / totalPages;
+        const tChunk = transcript.slice(Math.floor(ratio1 * transcript.length), Math.floor(ratio2 * transcript.length));
+        const content = [
+          ...batch.map(({ base64, slideNum }) => ([
+            { type: "text", text: `[슬라이드 ${slideNum}]` },
+            { type: "image", source: { type: "base64", media_type: "image/jpeg", data: base64 } }
+          ])).flat(),
+          { type: "text", text: `위 슬라이드들(${startSlide}~${endSlide}번)에 해당하는 강의 트랜스크립트입니다:\n\n---\n${tChunk}\n---\n\n슬라이드와 트랜스크립트를 매칭하고 다듬어 JSON으로 반환하세요. ${b===0?"title 필드에 강의 전체 제목을 넣으세요.":"title 필드는 빈 문자열로 두세요."}` }
+        ];
+        const raw = await callAPI(apiKey, [{ role: "user", content }]);
+        let cleaned = raw.replace(/```json|```/g, "").trim();
+        if (!cleaned.endsWith("}")) {
+          const lb = cleaned.lastIndexOf("},");
+          cleaned = lb > 0 ? cleaned.slice(0, lb + 1) + "]}" : cleaned + "]}";
+        }
+        let parsed;
+        try { parsed = JSON.parse(cleaned); }
+        catch {
+          const match = cleaned.match(/"slides"\s*:\s*(\[.*)/s);
+          if (match) { let arr = match[1]; if (!arr.endsWith("]")) arr = arr.slice(0, arr.lastIndexOf("},") + 1) + "]"; parsed = { title:"", slides: JSON.parse(arr) }; }
+          else throw new Error("JSON 파싱 실패");
+        }
+        if (b === 0) lectureTitle = parsed.title || "";
+        allSlideResults[b] = parsed.slides || [];
+        completedBatches++;
+        const elapsed = (Date.now() - startTime) / 1000;
+        const avg = elapsed / completedBatches;
+        const remaining = Math.ceil(avg * (batches.length - completedBatches));
+        setProgress(Math.round((completedBatches / batches.length) * 100));
+        setProcessingMsg(`AI 분석 중... (${completedBatches}/${batches.length} 배치 완료)`);
+        setTimeInfo(prev => ({
+          ...prev,
+          elapsed: Math.floor(elapsed),
+          remaining: completedBatches < batches.length ? remaining : 0,
+          batchTimes: [...prev.batchTimes, avg]
+        }));
+      };
+      for (let b = 0; b < batches.length; b += 2) {
+        await Promise.all(
+          Array.from({ length: Math.min(2, batches.length - b) }, (_, i) => processBatch(b + i))
+        );
+      }
+      allSlides = allSlideResults.flat();
+      setProgress(100);
+      if (timerRef.current) clearInterval(timerRef.current);
+      setResult({ title: lectureTitle, slides: allSlides });
+      setSelectedSlide(0); setStep(2);
+    } catch (err) {
+      if (timerRef.current) clearInterval(timerRef.current);
+      setError("오류: " + err.message); setStep(0);
+    }
+  };
+  const handleObsidianUpload = async () => {
+    if (!obsidianKey) { setExportStatus("Local REST API Key를 입력하세요."); return; }
+    setExportLoading("obsidian"); setExportStatus("");
+    const today = new Date().toISOString().split("T")[0];
+    const safe = result.title.replace(/[\\/:*?"<>|]/g, "_");
+    const baseUrl = "http://127.0.0.1:27123";
+    const headers = { Authorization: `Bearer ${obsidianKey}` };
+    try {
+      let uploaded = 0;
+      for (let i = 0; i < slideImages.length; i++) {
+        const img = slideImages[i];
+        const fname = getImgFilename(result.title, img.slideNum);
+        const bin = atob(img.base64);
+        const bytes = new Uint8Array(bin.length);
+        for (let j = 0; j < bin.length; j++) bytes[j] = bin.charCodeAt(j);
+        const res = await fetch(`${baseUrl}/vault/${encodeURIComponent(`${obsidianFolder}/images/${fname}`)}`, {
+          method: "PUT", headers: { ...headers, "Content-Type": "image/jpeg" }, body: bytes
+        });
+        if (res.ok || res.status===201 || res.status===204) uploaded++;
+      }
+      const md = buildMarkdownObsidian(result, result.title);
+      const mdRes = await fetch(`${baseUrl}/vault/${encodeURIComponent(`${obsidianFolder}/${today}-${safe}.md`)}`, {
+        method: "PUT", headers: { ...headers, "Content-Type": "text/markdown" }, body: md
+      });
+      setExportStatus(mdRes.ok || mdRes.status===201 || mdRes.status===204
+        ? `옵시디언 저장 완료! 이미지 ${uploaded}장 + 강의록 저장됨`
+        : `오류 ${mdRes.status}`);
+    } catch(e) { setExportStatus("연결 실패 — 옵시디언 + Local REST API 플러그인 확인"); }
+    finally { setExportLoading(""); }
+  };
+  const runExport = async (type) => {
+    setExportLoading(type); setExportStatus("");
+    try {
+      if (type === "md") { downloadMd(result, slideImages); setExportStatus("Markdown 파일 다운로드됨!"); }
+      else if (type === "html") { downloadHtml(result, slideImages); setExportStatus("HTML 파일 다운로드됨! (이미지 포함 단독 파일)"); }
+      else if (type === "docx") { await downloadDocx(result, slideImages, setProcessingMsg); setExportStatus("Word 파일 다운로드됨!"); }
+      else if (type === "pdf") { await downloadPdf(result, slideImages, msg => setProcessingMsg(msg)); setExportStatus("PDF 파일 다운로드됨!"); }
+      else if (type === "hwp") { copyForHwp(result); setExportStatus("텍스트가 복사됨! 한글(HWP)을 열고 Ctrl+V로 붙여넣으세요. (이미지는 직접 삽입 필요)"); }
+      else if (type === "txt") { const blob = new Blob([buildMarkdown(result, [], false)], {type:"text/plain;charset=utf-8"}); saveAs(blob, `${result.title.replace(/[\\/:*?"<>|]/g,"_")}.txt`); setExportStatus("텍스트 파일 다운로드됨!"); }
+    } catch(e) { setExportStatus("오류: " + e.message); console.error(e); }
+    finally { setExportLoading(""); }
+  };
+  const reset = () => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    setStep(0); setResult(null); setTranscript(""); setPdfFile(null); setSlideImages([]);
+    setError(""); setExportStatus(""); setSelectedSlide(0); setProgress(0);
+    setTimeInfo({ elapsed: 0, remaining: null, startTime: null, batchTimes: [] });
+  };
+  const S = {
+    card: { background:"#16161f", border:"1px solid #1e1e2a", borderRadius:14, padding:22 },
+    input: { width:"100%", background:"#0f0f13", border:"1px solid #222", borderRadius:9, padding:"9px 13px", color:"#e8e4dc", fontSize:13, fontFamily:"'Noto Sans KR',sans-serif" },
+    label: { fontSize:11, color:"#555", marginBottom:5, display:"block" },
+    tag: { padding:"2px 10px", borderRadius:20, fontSize:11, background:"#1e1528", color:"#a084e8", border:"1px solid #3d2a5c55" },
+  };
+  const currentSlide = result?.slides?.[selectedSlide];
+  const currentImage = currentSlide ? slideImages.find(img => img.slideNum === currentSlide.slideNumber) : null;
+  const EXPORT_OPTIONS = [
+    { id:"obsidian", icon:"🟣", name:"Obsidian", desc:"이미지+강의록\n자동 저장", special:true },
+    { id:"docx",    icon:"📘", name:"Word",     desc:"이미지 포함\n.docx 파일" },
+    { id:"pdf",     icon:"📕", name:"PDF",      desc:"이미지 포함\n.pdf 파일" },
+    { id:"html",    icon:"🌐", name:"HTML",     desc:"이미지 포함\n단독 웹파일" },
+    { id:"md",      icon:"📝", name:"Markdown", desc:"이미지 포함\n.md 파일" },
+    { id:"hwp",     icon:"📗", name:"한글(HWP)",desc:"텍스트 복사\n→ HWP 붙여넣기" },
+    { id:"txt",     icon:"📄", name:"텍스트",   desc:"순수 텍스트\n.txt 파일" },
+  ];
+  return (
+    <div style={{ minHeight:"100vh", background:"#0f0f13" }}>
+      <div style={{ borderBottom:"1px solid #1e1e2a", padding:"15px 28px", display:"flex", alignItems:"center", gap:12, background:"#13131c", position:"sticky", top:0, zIndex:100 }}>
+        <div style={{ width:38,height:38,borderRadius:10,background:"linear-gradient(135deg,#7c5cbf,#4f8ef7)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20 }}>&#128214;</div>
+        <div>
+          <div style={{ fontSize:16,fontWeight:700 }}>강의록 자동 생성기</div>
+          <div style={{ fontSize:11,color:"#555",marginTop:1 }}>다글로 + PDF → Obsidian / Word / PDF / HTML / HWP</div>
+        </div>
+        <div style={{ marginLeft:"auto",display:"flex",gap:8 }}>
+          <button onClick={()=>setShowApiKey(!showApiKey)} style={{ padding:"5px 13px",borderRadius:7,border:"1px solid #333",background:"#1a1a24",color:apiKey?"#4ade80":"#f87171",fontSize:11,cursor:"pointer" }}>
+            API Key {apiKey?"설정됨":"미설정!"}
+          </button>
+          {step===2 && <button onClick={reset} style={{ padding:"5px 13px",borderRadius:7,border:"1px solid #333",background:"#1a1a24",color:"#888",fontSize:11,cursor:"pointer" }}>새로 시작</button>}
+        </div>
+      </div>
+      {showApiKey && (
+        <div style={{ background:"#13131c",borderBottom:"1px solid #1e1e2a",padding:"16px 28px" }}>
+          <div style={{ maxWidth:600 }}>
+            <label style={S.label}>Anthropic API Key</label>
+            <input type="password" value={apiKey} onChange={e=>saveApiKey(e.target.value)} placeholder="sk-ant-api03-..." style={{ ...S.input,marginBottom:8 }} />
+            <div style={{ fontSize:11,color:"#444" }}>이 Key는 내 컴퓨터에만 저장됩니다. 발급: console.anthropic.com</div>
+          </div>
+        </div>
+      )}
+      <div style={{ display:"flex",justifyContent:"center",padding:"18px 28px 0",gap:4 }}>
+        {["① 업로드","② 처리중","③ 결과"].map((s,i) => (
+          <div key={i} style={{ display:"flex",alignItems:"center" }}>
+            <div style={{ padding:"5px 14px",borderRadius:20,fontSize:12,fontWeight:step===i?700:400,color:step===i?"#fff":step>i?"#a084e8":"#444",background:step===i?"linear-gradient(135deg,#7c5cbf,#4f8ef7)":"transparent",border:step>i?"1px solid #7c5cbf44":step===i?"none":"1px solid #222" }}>
+              {step>i?"완료 "+s.slice(2):s}
+            </div>
+            {i<2 && <div style={{ width:20,height:1,background:step>i?"#7c5cbf44":"#222" }}/>}
+          </div>
+        ))}
+      </div>
+      <div style={{ maxWidth:1100,margin:"0 auto",padding:"22px 20px" }}>
+        {step===0 && (
+          <div style={{ display:"flex",flexDirection:"column",gap:16 }} className="fade-in">
+            <div style={S.card}>
+              <div style={{ display:"flex",gap:9,alignItems:"center",marginBottom:14 }}>
+                <span style={{fontSize:22}}>&#127908;</span>
+                <div><div style={{fontWeight:700,fontSize:15}}>다글로 트랜스크립트</div><div style={{fontSize:11,color:"#555"}}>다글로 앱 → 녹음 종료 → 텍스트 추출 → 전체 복사 → 붙여넣기</div></div>
+              </div>
+              <textarea value={transcript} onChange={e=>setTranscript(e.target.value)} placeholder="여기에 다글로 텍스트를 붙여넣으세요 (Ctrl+V)..." style={{ ...S.input,minHeight:190,lineHeight:1.85,resize:"vertical" }} />
+              {transcript && <div style={{marginTop:6,fontSize:11,color:"#444"}}>{transcript.length.toLocaleString()}자 입력됨</div>}
+            </div>
+            <div style={S.card}>
+              <div style={{ display:"flex",gap:9,alignItems:"center",marginBottom:14 }}>
+                <span style={{fontSize:22}}>&#128202;</span>
+                <div><div style={{fontWeight:700,fontSize:15}}>강의 자료 PDF 업로드</div><div style={{fontSize:11,color:"#555"}}>대용량(50MB+) 지원 — 슬라이드 이미지 추출 후 AI 분석</div></div>
+              </div>
+              <div onDragOver={e=>{e.preventDefault();setDragOver(true);}} onDragLeave={()=>setDragOver(false)} onDrop={handleFileDrop} onClick={()=>fileRef.current.click()}
+                style={{ border:`2px dashed ${dragOver?"#7c5cbf":pdfFile?"#7c5cbf44":"#252530"}`,borderRadius:12,padding:"38px 20px",textAlign:"center",cursor:"pointer",background:pdfFile?"#1a1528":dragOver?"#1a1528":"#0f0f13",transition:"all 0.2s" }}>
+                {pdfFile
+                  ? <div><div style={{fontSize:14,fontWeight:600,color:"#a084e8",marginBottom:4}}>{pdfFile.name}</div><div style={{fontSize:11,color:"#555"}}>{(pdfFile.size/1024/1024).toFixed(1)}MB · 클릭하여 교체</div></div>
+                  : <div><div style={{fontSize:36,opacity:0.25,marginBottom:8}}>&#128194;</div><div style={{fontSize:14,color:"#444"}}>PDF를 드래그하거나 클릭하여 업로드</div></div>
+                }
+              </div>
+              <input ref={fileRef} type="file" accept=".pdf" onChange={handleFileDrop} style={{display:"none"}} />
+            </div>
+            {error && <div style={{background:"#1f0f0f",border:"1px solid #5c2020",borderRadius:10,padding:"10px 16px",fontSize:13,color:"#ff6b6b"}}>{error}</div>}
+            <button onClick={handleProcess} disabled={!transcript||!pdfFile||!apiKey}
+              style={{ padding:15,borderRadius:12,border:"none",cursor:!transcript||!pdfFile||!apiKey?"not-allowed":"pointer",background:transcript&&pdfFile&&apiKey?"linear-gradient(135deg,#7c5cbf,#4f8ef7)":"#1a1a24",color:transcript&&pdfFile&&apiKey?"#fff":"#444",fontSize:15,fontWeight:700,width:"100%" }}>
+              {!apiKey?"먼저 API Key를 입력하세요":"AI로 슬라이드 매칭 & 강의록 생성"}
+            </button>
+          </div>
+        )}
+        {step===1 && (
+          <div style={{textAlign:"center",padding:"70px 20px"}} className="fade-in">
+            <div style={{width:60,height:60,margin:"0 auto 24px",borderRadius:"50%",border:"3px solid #7c5cbf",borderTopColor:"transparent",animation:"spin 1s linear infinite"}}/>
+            <div style={{fontSize:18,fontWeight:700,marginBottom:10}}>처리 중...</div>
+            <div style={{fontSize:14,color:"#666",marginBottom:20}}>{processingMsg}</div>
+            <div style={{maxWidth:380,margin:"0 auto"}}>
+              <div style={{background:"#1e1e28",borderRadius:10,height:10,overflow:"hidden",marginBottom:12}}>
+                <div style={{height:"100%",width:progress+"%",background:"linear-gradient(90deg,#7c5cbf,#4f8ef7)",transition:"width 0.5s",borderRadius:10,minWidth:progress>0?"8px":"0"}}/>
+              </div>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                <span style={{fontSize:14,color:"#7c5cbf",fontWeight:700}}>{progress}%</span>
+                <span style={{fontSize:13,color:"#a084e8",fontWeight:600}}>
+                  {timeInfo.remaining === null ? "남은 시간 계산 중..." : timeInfo.remaining === 0 ? "✓ 거의 완료..." : `남은 시간 약 ${timeInfo.remaining >= 60 ? Math.floor(timeInfo.remaining/60)+"분 "+String(timeInfo.remaining%60).padStart(2,"0")+"초" : timeInfo.remaining+"초"}`}
+                </span>
+              </div>
+              <div style={{display:"flex",justifyContent:"center",gap:24}}>
+                <div style={{textAlign:"center"}}>
+                  <div style={{fontSize:10,color:"#444",marginBottom:2}}>경과</div>
+                  <div style={{fontSize:14,color:"#666",fontWeight:600,fontVariantNumeric:"tabular-nums"}}>
+                    {timeInfo.elapsed >= 60 ? Math.floor(timeInfo.elapsed/60)+"분 "+String(timeInfo.elapsed%60).padStart(2,"0")+"초" : timeInfo.elapsed+"초"}
+                  </div>
+                </div>
+                {timeInfo.remaining !== null && timeInfo.remaining > 0 && (
+                  <div style={{textAlign:"center"}}>
+                    <div style={{fontSize:10,color:"#444",marginBottom:2}}>예상 완료까지</div>
+                    <div style={{fontSize:14,color:"#a084e8",fontWeight:600,fontVariantNumeric:"tabular-nums"}}>
+                      {timeInfo.remaining >= 60 ? Math.floor(timeInfo.remaining/60)+"분 "+String(timeInfo.remaining%60).padStart(2,"0")+"초" : timeInfo.remaining+"초"}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+        {step===2 && result && (
+          <div className="fade-in">
+            <div style={{ ...S.card,marginBottom:16 }}>
+              <div style={{fontSize:11,color:"#555",marginBottom:4}}>강의 제목</div>
+              <div style={{fontSize:20,fontWeight:700,marginBottom:4}}>{result.title}</div>
+              <div style={{fontSize:12,color:"#555"}}>슬라이드 {result.slides?.length}개 · 이미지 {slideImages.length}장</div>
+            </div>
+            <div style={{ ...S.card,marginBottom:16 }}>
+              <div style={{fontWeight:700,fontSize:15,marginBottom:4}}>내보내기</div>
+              <div style={{fontSize:12,color:"#555",marginBottom:16}}>원하는 형식으로 강의록을 저장하세요</div>
+              <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:16}}>
+                {EXPORT_OPTIONS.map(opt => (
+                  <button key={opt.id} className="export-btn"
+                    onClick={() => opt.id==="obsidian" ? setShowObsidian(!showObsidian) : runExport(opt.id)}
+                    disabled={exportLoading===opt.id}
+                    style={{
+                      display:"flex",flexDirection:"column",alignItems:"center",gap:6,
+                      padding:"14px 12px",borderRadius:12,cursor:"pointer",minWidth:90,
+                      border:opt.id==="obsidian"&&showObsidian?"1px solid #7c5cbf":"1px solid #2a2a35",
+                      background:opt.id==="obsidian"&&showObsidian?"#1a1528":"#13131c",
+                      opacity:exportLoading&&exportLoading!==opt.id?0.5:1,
+                      transition:"all 0.2s"
+                    }}>
+                    <span style={{fontSize:26}}>{exportLoading===opt.id?"⏳":opt.icon}</span>
+                    <span style={{fontSize:12,fontWeight:700,color:"#ccc"}}>{opt.name}</span>
+                    <span style={{fontSize:10,color:"#555",textAlign:"center",lineHeight:1.4,whiteSpace:"pre-line"}}>{opt.desc}</span>
+                  </button>
+                ))}
+              </div>
+              {exportStatus && (
+                <div style={{padding:"10px 14px",borderRadius:9,background:exportStatus.includes("완료")||exportStatus.includes("됨")?"#0f1f14":"#1f1020",border:`1px solid ${exportStatus.includes("완료")||exportStatus.includes("됨")?"#1a4a25":"#4a1a3a"}`,fontSize:13,color:exportStatus.includes("완료")||exportStatus.includes("됨")?"#4ade80":"#f0abfc"}}>
+                  {exportStatus}
+                </div>
+              )}
+              {showObsidian && (
+                <div style={{marginTop:16,padding:16,background:"#0f0f13",borderRadius:12,border:"1px solid #3d2a5c44"}}>
+                  <div style={{fontWeight:700,marginBottom:10,fontSize:13,color:"#a084e8"}}>🟣 옵시디언 설정</div>
+                  <div style={{fontSize:11,color:"#555",marginBottom:12,lineHeight:1.7}}>
+                    설정 (최초 1회): 옵시디언 → 커뮤니티 플러그인 → <strong>Local REST API</strong> 설치 → API Key 복사
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
+                    <div><label style={S.label}>Local REST API Key</label><input type="password" value={obsidianKey} onChange={e=>saveObsKey(e.target.value)} placeholder="플러그인에서 복사한 Key" style={S.input}/></div>
+                    <div><label style={S.label}>저장할 폴더</label><input value={obsidianFolder} onChange={e=>saveObsFolder(e.target.value)} placeholder="강의록" style={S.input}/></div>
+                  </div>
+                  <button onClick={handleObsidianUpload} disabled={!!exportLoading}
+                    style={{padding:"10px 22px",borderRadius:9,background:"linear-gradient(135deg,#7c5cbf,#4f8ef7)",border:"none",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer"}}>
+                    {exportLoading==="obsidian"?"저장 중...":"이미지 "+slideImages.length+"장 + 강의록 저장"}
+                  </button>
+                </div>
+              )}
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"210px 1fr",gap:14}}>
+              <div style={{...S.card,padding:0,overflow:"hidden",height:"fit-content",maxHeight:680,overflowY:"auto"}}>
+                {result.slides?.map((s,i) => {
+                  const img = slideImages.find(img=>img.slideNum===s.slideNumber);
+                  return (
+                    <div key={i} onClick={()=>setSelectedSlide(i)} style={{padding:"10px 12px",cursor:"pointer",background:selectedSlide===i?"#1a1528":"transparent",borderLeft:`3px solid ${selectedSlide===i?"#7c5cbf":"transparent"}`,borderBottom:"1px solid #1a1a22",transition:"all 0.15s"}}>
+                      {img && <img src={img.dataUrl} style={{width:"100%",borderRadius:4,marginBottom:5,opacity:selectedSlide===i?1:0.55}}/>}
+                      <div style={{fontSize:10,color:"#555"}}>SLIDE {s.slideNumber} {s.hasVisual?"📊":""}</div>
+                      <div style={{fontSize:11,fontWeight:selectedSlide===i?700:400,color:selectedSlide===i?"#c4a8ff":"#777",lineHeight:1.4,overflow:"hidden",display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical"}}>{s.slideTitle}</div>
+                    </div>
+                  );
+                })}
+              </div>
+              {currentSlide && (
+                <div style={{...S.card,display:"flex",flexDirection:"column",gap:18}}>
+                  <div>
+                    <div style={{fontSize:10,color:"#7c5cbf",fontWeight:700,letterSpacing:1,marginBottom:6}}>SLIDE {currentSlide.slideNumber}</div>
+                    <div style={{fontSize:20,fontWeight:700,lineHeight:1.4}}>{currentSlide.slideTitle}</div>
+                    {currentSlide.keywords?.length>0 && <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:10}}>{currentSlide.keywords.map((k,i)=><span key={i} style={S.tag}>#{k}</span>)}</div>}
+                  </div>
+                  {currentImage && (
+                    <div>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                        <div style={{fontSize:11,color:"#555",fontWeight:600}}>슬라이드 이미지 {currentSlide.hasVisual&&<span style={{color:"#f59e0b",fontSize:10}}>· 시각자료 포함</span>}</div>
+                        <button onClick={()=>setShowImages(!showImages)} style={{fontSize:10,color:"#555",background:"none",border:"none",cursor:"pointer"}}>{showImages?"숨기기":"보기"}</button>
+                      </div>
+                      {showImages && <img src={currentImage.dataUrl} style={{width:"100%",borderRadius:10,border:"1px solid #2a2a35"}}/>}
+                    </div>
+                  )}
+                  {currentSlide.slideContent && <div><div style={{fontSize:11,color:"#555",fontWeight:600,marginBottom:8}}>슬라이드 내용</div><div style={{background:"#0f0f13",border:"1px solid #1e1e2a",borderRadius:10,padding:"12px 16px",fontSize:13,lineHeight:1.9,color:"#bbb",whiteSpace:"pre-wrap"}}>{currentSlide.slideContent}</div></div>}
+                  {currentSlide.transcript && <div><div style={{fontSize:11,color:"#555",fontWeight:600,marginBottom:8}}>강의 내용 <span style={{color:"#444",fontWeight:400}}>(AI 최소 다듬기)</span></div><div style={{background:"#0f1520",border:"1px solid #1a3045",borderRadius:10,padding:"14px 18px",fontSize:14,lineHeight:2.1,color:"#cce0f5",whiteSpace:"pre-wrap"}}>{currentSlide.transcript}</div></div>}
+                  <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+                    <button onClick={()=>setSelectedSlide(Math.max(0,selectedSlide-1))} disabled={selectedSlide===0} style={{padding:"7px 16px",borderRadius:7,border:"1px solid #222",background:"#1a1a24",color:selectedSlide===0?"#333":"#888",fontSize:12,cursor:selectedSlide===0?"default":"pointer"}}>이전</button>
+                    <button onClick={()=>setSelectedSlide(Math.min(result.slides.length-1,selectedSlide+1))} disabled={selectedSlide===result.slides.length-1} style={{padding:"7px 16px",borderRadius:7,border:"1px solid #222",background:"#1a1a24",color:selectedSlide===result.slides.length-1?"#333":"#888",fontSize:12,cursor:selectedSlide===result.slides.length-1?"default":"pointer"}}>다음</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
